@@ -61,7 +61,7 @@ If you want the best Refraction & Performance setup, you can simply copy this an
             "settings": true,
             "panes": true
         },
-        "customSelectors": "#app-mount button\n#app-mount input\n#app-mount input",
+        "customSelectors": "#app-mount button",
         "maxSurfaces": 200,
         "avoidNesting": true,
         "neutralizeAncestors": true,
