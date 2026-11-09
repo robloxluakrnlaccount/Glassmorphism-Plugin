@@ -1,4 +1,4 @@
-# Translucence Liquid Glass
+# Liquid Glass (Glassmorphism)
 Adds physics-based glassmorphism and real-time refraction to Discord UI containers.
 
 This plugin is designed to be applied alongside a translucent or transparent base theme. It is highly recommended and tested to pair perfectly with *Translucence by CapnKitten*. Compatibility with other themes may vary, as elements were tested specifically using Translucence.
