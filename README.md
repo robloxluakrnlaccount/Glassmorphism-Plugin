@@ -16,3 +16,7 @@ When you first load the plugin, you will be prompted to select a rendering tier.
 ## Features
 * **Physics-Based Refraction:** Uses Snell's Law calculations to bend the background layer around UI borders.
 * **Smart Performance Capping:** Leverages Intersection and Resize Observers to ensure only on-screen containers consume GPU rendering cycles.
+
+---
+
+It should be fine, and bugs could be minor, meaning they do almost no harm, but if there is a major bug, you should definitely report it.
