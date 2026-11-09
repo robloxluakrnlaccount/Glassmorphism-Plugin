@@ -109,9 +109,9 @@ const DEFAULTS = {
     enabled: true,
 
     // shape
-    surface: "convex_squircle",
+    surface: "convex_circle",
     sizeMode: "relative",   // relative (short side / divisor) or fixed (px)
-    divisor: 3,             // 1 unit = short side / divisor
+    divisor: 3.5,             // 1 unit = short side / divisor
     thicknessRel: 3,        // thickness in units
     bezelRel: 0.65,         // bezel width in units
     thicknessPx: 60,
