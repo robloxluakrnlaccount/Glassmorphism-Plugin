@@ -1,5 +1,5 @@
 /**
- * @name TranslucenceLiquidGlass
+ * @name Liquid Glass (glassmorphism)
  * @author scripteditorpro
  * @version 4.2.0
  * @description Adds glassmorphism to Discord, mostly for transparent themes (Translucence by CapnKitten recommended). Adds actual refraction to UI elements, with settings you can change. WARNING: might lag. Change the settings to make it smoother if needed.
