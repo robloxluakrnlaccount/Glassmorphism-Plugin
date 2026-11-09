@@ -20,3 +20,55 @@ When you first load the plugin, you will be prompted to select a rendering tier.
 ---
 
 It should be fine, and bugs could be minor, meaning they do almost no harm, but if there is a major bug, you should definitely report it.
+
+---
+
+
+If you want the best Refraction & Performance setup, you can simply copy this and rewrite the config.json with it.
+'''{
+    "settings": {
+        "settingsVersion": 4,
+        "presetChosen": "Default",
+        "enabled": true,
+        "surface": "convex_circle",
+        "sizeMode": "relative",
+        "divisor": 3,
+        "thicknessRel": 4,
+        "bezelRel": 1,
+        "thicknessPx": 60,
+        "bezelPx": 14,
+        "ior": 1.5,
+        "refraction": 1,
+        "maxDisplacement": 45,
+        "quality": 0.5,
+        "blur": 1,
+        "saturation": 1.25,
+        "brightness": 1.05,
+        "specular": 0.8,
+        "specularAngle": 60,
+        "specularWidth": 1.5,
+        "groups": {
+            "modals": true,
+            "popouts": true,
+            "tooltips": true,
+            "composer": true,
+            "cards": true,
+            "activity": true,
+            "custom": true,
+            "messages": true,
+            "buttons": true,
+            "settings": true,
+            "panes": true
+        },
+        "customSelectors": "#app-mount button\n#app-mount input\n#app-mount input",
+        "maxSurfaces": 200,
+        "avoidNesting": true,
+        "neutralizeAncestors": true,
+        "largeThreshold": 2000,
+        "largeDetail": "full",
+        "largeQuality": 0.5,
+        "profiles": {},
+        "highlight": false,
+        "debug": false
+    }
+}'''
