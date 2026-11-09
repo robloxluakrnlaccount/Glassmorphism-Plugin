@@ -1,7 +1,7 @@
 /**
  * @name Liquid Glass (glassmorphism)
  * @author scripteditorpro
- * @version 4.3.0
+ * @version 4.3.1
  * @description Adds glassmorphism to Discord, mostly for transparent themes (Translucence by CapnKitten recommended). Adds actual refraction to UI elements, with settings you can change. WARNING: might lag. Change the settings to make it smoother if needed.
  */
 "use strict";
@@ -13,6 +13,9 @@ const ATTR = "data-tg-glass";
 const ATTR_KIND = "data-tg-kind";
 const DEFS_ID = "tg-liquid-glass-definitions";
 const INNER_GROUPS = new Set(["modals", "popouts", "tooltips", "cards", "activity", "custom"]);
+// a custom selector that matches more than this many elements is way too broad, we skip it
+const MAX_CUSTOM_MATCHES = 30;
+const BIG_OK = new Set(["modals", "settings", "panes", "custom"]);
 const ROOT_VARS = ["--tg-glass-blur", "--tg-glass-refraction", "--tg-glass-specular"];
 const STYLE_ID = "tg-liquid-glass-runtime";
 const SAMPLES = 128;
@@ -147,7 +150,7 @@ const DEFAULTS = {
     largeDetail: "lite",    // full | lite | blur
     largeQuality: 0.5,      // map res multiplier for big surfaces
 
-    // per group overrides (see BASE_PROFILE)
+    // per group overrides
     profiles: {},
 
     // debug
@@ -283,7 +286,7 @@ module.exports = class TranslucenceLiquidGlass {
         let saved = {};
         try { saved = BdApi.Data.load(PLUGIN_ID, "settings") || {}; } catch (e) { /* ignore */ }
 
-        // old (pre v4) settings used a different scale
+        // old settings used a different scale
         const compatible = saved.settingsVersion === SETTINGS_VERSION;
         const base = compatible ? saved : { enabled: saved.enabled !== false, debug: !!saved.debug };
 
@@ -305,7 +308,7 @@ module.exports = class TranslucenceLiquidGlass {
     start() {
         if (this.running || this.waiting) return;
 
-        // fresh install: show the picker first and dont touch discord yet
+        // fresh install; show the picker first and dont touch discord yet
         if (this.needsPreset) {
             this.waiting = true;
             this.showPresetPicker();
@@ -439,7 +442,22 @@ module.exports = class TranslucenceLiquidGlass {
                 if (!selectors.length) continue;
 
                 const lists = [];
-                try { lists.push(document.querySelectorAll(selectors.join(","))); }
+
+                if (key === "custom") {
+                    // check these one at a time, a too broad one (like div[class*='container_']) would put
+                    // glass on half of discord and mess up the whole ui
+                    for (const selector of selectors) {
+                        let list;
+                        try { list = document.querySelectorAll(selector); }
+                        catch (err) { this.log("bad selector", selector, err.message); continue; }
+
+                        if (list.length > MAX_CUSTOM_MATCHES) {
+                            this.warnBroadSelector(selector, list.length);
+                            continue;
+                        }
+                        lists.push(list);
+                    }
+                } else try { lists.push(document.querySelectorAll(selectors.join(","))); }
                 catch (e) {
                     // one bad selector (prob a custom one) shouldnt break the rest
                     for (const selector of selectors) {
@@ -474,6 +492,15 @@ module.exports = class TranslucenceLiquidGlass {
         }
 
         this.reconcile();
+    }
+
+    warnBroadSelector(selector, count) {
+        this.skippedSelectors = this.skippedSelectors || new Set();
+        if (this.skippedSelectors.has(selector)) return;
+        this.skippedSelectors.add(selector);
+
+        console.warn(`[TranslucenceLiquidGlass] custom selector skipped, it matches ${count} elements (max ${MAX_CUSTOM_MATCHES}): ${selector}`);
+        try { BdApi.UI.showToast(`Liquid Glass: a custom selector matches ${count} elements so it was skipped. Check the custom selectors in settings.`, { type: "warning" }); } catch (e) { /* ignore */ }
     }
 
     reconcile() {
@@ -530,6 +557,13 @@ module.exports = class TranslucenceLiquidGlass {
     attach(el, key) {
         const m = this.measure(el);
         if (m.w < 24 || m.h < 18 || m.w > 2600 || m.h > 2600) return false;
+
+        // a thing that covers most of the window is a layout container not a surface, only
+        // the groups that are meant for big stuff (or ones you picked yourself) are allowed
+        if (!BIG_OK.has(key) && m.w > window.innerWidth * 0.6 && m.h > window.innerHeight * 0.6) {
+            this.log("skipped, covers most of the window", key, el);
+            return false;
+        }
 
         const score = this.surfaceScore(el);
 
@@ -1341,17 +1375,24 @@ module.exports = class TranslucenceLiquidGlass {
             ? "Glass is on for something in this stack. If it still looks flat, check the notes below."
             : "Nothing in this stack has glass on it.";
 
-        const text = `${header}\n\n${lines.join("\n")}${best ? `\n\nBest guess for the visible card: \`${this.describe(best)}\`` : ""}`;
+        const bestSelector = best ? this.selectorFor(best) : null;
+        let bestNote = "";
+        if (best && bestSelector) bestNote = `\n\nBest guess for the visible card: \`${this.describe(best)}\`\n\nSelector it would add: \`${bestSelector}\``;
+        else if (best) bestNote = `\n\nBest guess for the visible card: \`${this.describe(best)}\`, but its classes are too generic to make a safe selector. Try picking a more specific element.`;
+
+        const canAdd = !!(best && bestSelector && !chain.some(el => this.records.has(el)));
+
+        const text = `${header}\n\n${lines.join("\n")}${bestNote}`;
 
         console.info("[TranslucenceLiquidGlass] inspect\n" + text.replace(/\*\*|`/g, ""));
 
         try {
             BdApi.UI.showConfirmationModal("Glass check", text, {
-                confirmText: best && !hasGlass ? "Add best guess as glass" : "Close",
-                cancelText: best && !hasGlass ? "Close" : null,
+                confirmText: canAdd ? "Add best guess as glass" : "Close",
+                cancelText: canAdd ? "Close" : null,
                 onConfirm: () => {
-                    if (!best || hasGlass) return;
-                    const selector = this.selectorFor(best);
+                    if (!canAdd) return;
+                    const selector = bestSelector;
                     const list = this.settings.customSelectors.split("\n").map(x => x.trim()).filter(Boolean);
                     if (!list.includes(selector)) list.push(selector);
                     this.settings.customSelectors = list.join("\n");
@@ -1413,15 +1454,42 @@ module.exports = class TranslucenceLiquidGlass {
         this.picker = null;
     }
 
+    // builds a selector for el that matches only a few things. returns null if it cant make a safe one
     selectorFor(el) {
-        // classes look like name_a1b2c3, the hash changes but the name part doesnt
-        const classes = [...el.classList]
-            .map(c => c.match(/^([a-zA-Z]+)_{1,2}[a-zA-Z0-9]{5,8}$/))
-            .filter(Boolean)
-            .map(match => `[class*='${match[1]}_']`);
+        const esc = text => (typeof CSS !== "undefined" && CSS.escape ? CSS.escape(text) : text.replace(/[^a-zA-Z0-9_-]/g, "\\$&"));
+        const stable = /^([a-zA-Z]+)_{1,2}[a-zA-Z0-9]{5,8}$/;
 
-        // 2 classes is usually enough to not match random other stuff
-        return `#app-mount ${el.tagName.toLowerCase()}${classes.slice(0, 2).join("")}`;
+        // classes look like name_a1b2c3, the hash changes between discord updates but the name doesnt
+        const build = node => {
+            const classes = [...node.classList];
+            const prefixes = classes.map(c => c.match(stable)).filter(Boolean).map(m => `[class*='${m[1]}_']`);
+            const exact = classes.map(c => "." + esc(c));
+            return {
+                tag: node.tagName.toLowerCase(),
+                options: [prefixes.slice(0, 2).join(""), prefixes.join(""), exact.join("")].filter(Boolean)
+            };
+        };
+
+        const self = build(el);
+        const parent = el.parentElement && el.parentElement !== document.body ? build(el.parentElement) : null;
+
+        const tries = [];
+        for (const o of self.options) tries.push(`#app-mount ${self.tag}${o}`);
+        if (parent) {
+            for (const po of parent.options) {
+                for (const o of self.options) tries.push(`#app-mount ${parent.tag}${po} > ${self.tag}${o}`);
+            }
+        }
+
+        // first one that really hits this element and only a handful of others wins (durable ones come first)
+        for (const selector of new Set(tries)) {
+            try {
+                const count = document.querySelectorAll(selector).length;
+                if (count >= 1 && count <= 5 && el.matches(selector)) return selector;
+            } catch (e) { /* ignore */ }
+        }
+
+        return null;
     }
 
     // ---- settings panel ----
@@ -1720,6 +1788,10 @@ module.exports = class TranslucenceLiquidGlass {
             area.addEventListener("change", () => this.updateSetting("customSelectors", area.value));
             customBox.append(customTitle, area, button("Pick an element…", () => {
                 this.startPicker((el, selector) => {
+                    if (!selector) {
+                        try { BdApi.UI.showToast("Liquid Glass: that element's classes are too generic for a safe selector. Pick a more specific one.", { type: "warning" }); } catch (e) { /* ignore */ }
+                        return;
+                    }
                     const next = [area.value.trim(), selector].filter(Boolean).join("\n");
                     area.value = next;
                     this.settings.groups.custom = true;
