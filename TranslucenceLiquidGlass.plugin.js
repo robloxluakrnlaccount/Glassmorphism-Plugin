@@ -1,10 +1,9 @@
 /**
  * @name Liquid Glass (glassmorphism)
  * @author scripteditorpro
- * @version 4.2.0
+ * @version 4.3.0
  * @description Adds glassmorphism to Discord, mostly for transparent themes (Translucence by CapnKitten recommended). Adds actual refraction to UI elements, with settings you can change. WARNING: might lag. Change the settings to make it smoother if needed.
  */
-
 "use strict";
 
 const PLUGIN_ID = "TranslucenceLiquidGlass";
@@ -13,10 +12,12 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 const ATTR = "data-tg-glass";
 const ATTR_KIND = "data-tg-kind";
 const DEFS_ID = "tg-liquid-glass-definitions";
+const INNER_GROUPS = new Set(["modals", "popouts", "tooltips", "cards", "activity", "custom"]);
+const ROOT_VARS = ["--tg-glass-blur", "--tg-glass-refraction", "--tg-glass-specular"];
 const STYLE_ID = "tg-liquid-glass-runtime";
 const SAMPLES = 128;
 
-// glass height curves, taken from the liquid glass demo
+// glass height curves from the liquid glass
 const SURFACES = {
     convex_squircle: { label: "Convex squircle (iOS)", fn: x => Math.pow(1 - Math.pow(1 - x, 4), 1 / 4) },
     convex_circle: { label: "Convex circle", fn: x => Math.sqrt(1 - Math.pow(1 - x, 2)) },
@@ -32,17 +33,27 @@ const SURFACES = {
     }
 };
 
-// the groups of stuff we put glass on.
+// the groups of stuff it puts glass on.
 // lower rank wins if two glass things overlap. a glass parent blinds
 // everything inside it, so only one of them can actually refract the bg
 const GROUPS = {
     modals: {
         label: "Modals & dialogs", rank: 0,
-        selectors: ["#app-mount [class*='modal_']:not([class*='modalContent'])", "#app-mount [class*='root_'][class*='fullscreenOnMobile']"]
+        selectors: [
+            "#app-mount [class*='modal_']:not([class*='modalContent'])",
+            "#app-mount [class*='root_'][class*='fullscreenOnMobile']",
+            "#app-mount .user-profile-modal"
+        ]
     },
     popouts: {
         label: "Popouts, menus & user cards", rank: 1,
-        selectors: ["#app-mount [class*='menu_']", "#app-mount [class*='popout_']", "#app-mount [class*='userPopoutOuter']"]
+        selectors: [
+            "#app-mount [class*='menu_']",
+            "#app-mount [class*='popout_']",
+            "#app-mount [class*='userPopoutOuter']",
+            "#app-mount [class*='userProfileOuter']",
+            "#app-mount .user-profile-popout"
+        ]
     },
     tooltips: {
         label: "Tooltips", rank: 1,
@@ -128,6 +139,8 @@ const DEFAULTS = {
     maxSurfaces: 80,
     avoidNesting: true,
     neutralizeAncestors: true,
+    neutralizeInner: true,
+    hotkey: true,
 
     // big stuff (settings, panes, anything over the threshold)
     largeThreshold: 300,    // in thousands of px² (300 is about 700x430)
@@ -164,7 +177,7 @@ const PROFILE_PRESETS = {
 };
 
 // these need more than just swapping filters when they change
-const FULL_REBUILD = new Set(["enabled", "neutralizeAncestors", "avoidNesting"]);
+const FULL_REBUILD = new Set(["enabled", "neutralizeAncestors", "neutralizeInner", "avoidNesting"]);
 const RESCAN = new Set(["customSelectors", "maxSurfaces"]);
 const STYLE_ONLY = new Set(["highlight", "debug"]);
 
@@ -270,7 +283,7 @@ module.exports = class TranslucenceLiquidGlass {
         let saved = {};
         try { saved = BdApi.Data.load(PLUGIN_ID, "settings") || {}; } catch (e) { /* ignore */ }
 
-        // old (pre v4) settings used a different scale, so just drop those
+        // old (pre v4) settings used a different scale
         const compatible = saved.settingsVersion === SETTINGS_VERSION;
         const base = compatible ? saved : { enabled: saved.enabled !== false, debug: !!saved.debug };
 
@@ -335,6 +348,14 @@ module.exports = class TranslucenceLiquidGlass {
         });
         this.mutationObserver.observe(document.getElementById("app-mount") || document.body, { childList: true, subtree: true });
 
+        // ctrl + shift + g = inspect something (works while a popout is open, settings doesnt)
+        this.onKey = e => {
+            if (!this.settings.hotkey || !e.ctrlKey || !e.shiftKey || e.code !== "KeyG") return;
+            e.preventDefault();
+            this.startPicker(el => this.inspect(el));
+        };
+        document.addEventListener("keydown", this.onKey, true);
+
         this.refreshRuntimeStyle();
         this.scan();
         this.scanInterval = setInterval(() => { if (!document.hidden) this.scan(); }, 5000);
@@ -354,6 +375,8 @@ module.exports = class TranslucenceLiquidGlass {
         cancelAnimationFrame(this.pumpFrame);
         this.refreshQueue = [];
         this.stopPicker();
+        if (this.onKey) document.removeEventListener("keydown", this.onKey, true);
+        this.onKey = null;
 
         this.mutationObserver?.disconnect();
         this.resizeObserver?.disconnect();
@@ -366,11 +389,20 @@ module.exports = class TranslucenceLiquidGlass {
         this.visible.clear();
         this.filters.clear();
         this.mapCache.clear();
+        this.tableCache.clear();
         this.neutral.clear();
         this.cleanAncestors = new WeakSet();
 
+        // put <html> back how we found it
+        const rootStyle = document.documentElement.style;
+        for (const name of ROOT_VARS) rootStyle.removeProperty(name);
+        if (document.documentElement.getAttribute("style") === "") document.documentElement.removeAttribute("style");
+
+        this.removeRuntimeStyle();
+
         this.root?.remove();
-        document.getElementById(STYLE_ID)?.remove();
+        this.root = null;
+        this.defs = null;
 
         this.log("stopped");
     }
@@ -499,13 +531,21 @@ module.exports = class TranslucenceLiquidGlass {
         const m = this.measure(el);
         if (m.w < 24 || m.h < 18 || m.w > 2600 || m.h > 2600) return false;
 
+        const score = this.surfaceScore(el);
+
         if (this.settings.avoidNesting) {
             const conflicts = this.conflictsFor(el);
             const rank = GROUPS[key].rank;
 
             for (const other of conflicts) {
-                if (this.records.get(other).rank <= rank) {
-                    this.log("skipped (nested under/over higher-priority glass)", key, el);
+                const rec = this.records.get(other);
+                if (rec.rank < rank) {
+                    this.log("skipped, nested next to higher priority glass", key, el);
+                    return false;
+                }
+                // same priority: keep whichever one actually looks like the visible card
+                if (rec.rank === rank && !this.prefers(el, score, other, rec.score)) {
+                    this.log("skipped, other element is the better surface", key, el);
                     return false;
                 }
             }
@@ -521,7 +561,7 @@ module.exports = class TranslucenceLiquidGlass {
             };
         }
 
-        const record = { key, rank: GROUPS[key].rank, previous, filterKey: null, w: 0, h: 0, neutralized: [] };
+        const record = { key, rank: GROUPS[key].rank, score, previous, filterKey: null, w: 0, h: 0, neutralized: [] };
         this.records.set(el, record);
 
         el.setAttribute(ATTR, "active");
@@ -531,6 +571,7 @@ module.exports = class TranslucenceLiquidGlass {
         this.resizeObserver.observe(el);
 
         if (this.settings.neutralizeAncestors) this.neutralizeAncestors(el, record);
+        if (this.settings.neutralizeInner && INNER_GROUPS.has(key)) this.neutralizeInner(el, record);
         if (this.settings.debug) this.reportBlockers(el, key);
 
         return true;
@@ -549,6 +590,10 @@ module.exports = class TranslucenceLiquidGlass {
 
         el.removeAttribute(ATTR);
         el.removeAttribute(ATTR_KIND);
+        if (el.getAttribute("style") === "") el.removeAttribute("style");
+
+        clearTimeout(record.refreshTimer);
+        record.refreshTimer = null;
 
         this.releaseFilter(record.filterKey);
         this.restoreAncestors(record);
@@ -610,33 +655,81 @@ module.exports = class TranslucenceLiquidGlass {
     }
 
     // ---- backdrop root stuff (why nested glass doesnt work) ----
+    // rough "confirming" score since idk if this gonna work on mac
+    surfaceScore(el) {
+        const cs = getComputedStyle(el);
+        let score = 0;
+
+        if (parseFloat(cs.borderTopLeftRadius) > 0) score += 2;
+        if (cs.boxShadow && cs.boxShadow !== "none") score += 1;
+        if (cs.backgroundImage && cs.backgroundImage !== "none") score += 1;
+        const bg = cs.backgroundColor;
+        if (bg && bg !== "transparent" && !/^rgba\(\s*\d+,\s*\d+,\s*\d+,\s*0\s*\)$/.test(bg)) score += 1;
+
+        return score;
+    }
+
+    // same rank overlap: better score wins, if equal the inner one wins
+    prefers(el, score, other, otherScore) {
+        if (score !== otherScore) return score > otherScore;
+        return other.contains(el);
+    }
+
+    // clears backdrop-filter on one element and remembers how to put it back
+    neutralizeNode(node, record) {
+        if (this.neutral.has(node)) {
+            this.neutral.get(node).refs++;
+            record.neutralized.push(node);
+            return;
+        }
+
+        this.neutral.set(node, {
+            refs: 1,
+            prev: {
+                bf: [node.style.getPropertyValue("backdrop-filter"), node.style.getPropertyPriority("backdrop-filter")],
+                wbf: [node.style.getPropertyValue("-webkit-backdrop-filter"), node.style.getPropertyPriority("-webkit-backdrop-filter")]
+            }
+        });
+        node.style.setProperty("backdrop-filter", "none", "important");
+        node.style.setProperty("-webkit-backdrop-filter", "none", "important");
+        record.neutralized.push(node);
+    }
+
     neutralizeAncestors(el, record) {
         let p = el.parentElement;
 
         while (p && p !== document.documentElement) {
             if (!this.records.has(p)) {
                 if (this.neutral.has(p)) {
-                    this.neutral.get(p).refs++;
-                    record.neutralized.push(p);
+                    this.neutralizeNode(p, record);
                 } else if (!this.cleanAncestors.has(p)) {
                     const cs = getComputedStyle(p);
-                    if (!cs.backdropFilter || cs.backdropFilter === "none") {
-                        this.cleanAncestors.add(p);
-                    } else {
-                        this.neutral.set(p, {
-                            refs: 1,
-                            prev: {
-                                bf: [p.style.getPropertyValue("backdrop-filter"), p.style.getPropertyPriority("backdrop-filter")],
-                                wbf: [p.style.getPropertyValue("-webkit-backdrop-filter"), p.style.getPropertyPriority("-webkit-backdrop-filter")]
-                            }
-                        });
-                        p.style.setProperty("backdrop-filter", "none", "important");
-                        p.style.setProperty("-webkit-backdrop-filter", "none", "important");
-                        record.neutralized.push(p);
-                    }
+                    if (!cs.backdropFilter || cs.backdropFilter === "none") this.cleanAncestors.add(p);
+                    else this.neutralizeNode(p, record);
                 }
             }
             p = p.parentElement;
+        }
+    }
+
+    // a see-through layer with its own backdrop-filter covering most of the card can sit on top
+    // of our refraction, so clear those. small stuff (pills etc) is left alone
+    neutralizeInner(el, record) {
+        const area = record.w * record.h;
+        if (!area) return;
+
+        const nodes = el.querySelectorAll("*");
+        const limit = Math.min(nodes.length, 600);
+
+        for (let i = 0; i < limit; i++) {
+            const n = nodes[i];
+            if (this.records.has(n)) continue;
+
+            const cs = getComputedStyle(n);
+            if (!cs.backdropFilter || cs.backdropFilter === "none") continue;
+            if (n.offsetWidth * n.offsetHeight < area * 0.6) continue;
+
+            this.neutralizeNode(n, record);
         }
     }
 
@@ -796,7 +889,7 @@ module.exports = class TranslucenceLiquidGlass {
 
     // full = blur, refract, saturate, brightness, highlight rim
     // lite = same but no highlight (one less image pass)
-    // blur = no refraction at all, no maps, cheapest
+    // blur = no refraction at all, no maps cheapest
     buildFilter(id, maps, m, detail) {
         const s = this.settings;
 
@@ -982,7 +1075,12 @@ module.exports = class TranslucenceLiquidGlass {
         canvas.width = imageData.width;
         canvas.height = imageData.height;
         canvas.getContext("2d").putImageData(imageData, 0, 0);
-        return canvas.toDataURL("image/png");
+        const url = canvas.toDataURL("image/png");
+
+        // we only want the string, dont keep the pixel buffer around
+        canvas.width = 0;
+        canvas.height = 0;
+        return url;
     }
 
     // ---- applying settings ----
@@ -992,8 +1090,7 @@ module.exports = class TranslucenceLiquidGlass {
             css += `[${ATTR}="active"]{outline:1px dashed rgba(0,255,170,.9)!important;outline-offset:-1px;}`;
         }
 
-        try { BdApi.DOM.removeStyle(STYLE_ID); } catch (e) { /* ignore */ }
-        document.getElementById(STYLE_ID)?.remove();
+        this.removeRuntimeStyle();
 
         if (!css) return;
 
@@ -1006,13 +1103,18 @@ module.exports = class TranslucenceLiquidGlass {
         }
     }
 
+    removeRuntimeStyle() {
+        try { BdApi.DOM.removeStyle(STYLE_ID); } catch (e) { /* ignore */ }
+        document.getElementById(STYLE_ID)?.remove();
+    }
+
     applySettings(level = "full") {
         if (!this.running) return;
 
         const root = document.documentElement.style;
-        root.setProperty("--tg-glass-blur", `${this.settings.blur}px`);
-        root.setProperty("--tg-glass-refraction", this.settings.refraction);
-        root.setProperty("--tg-glass-specular", this.settings.specular);
+        root.setProperty(ROOT_VARS[0], `${this.settings.blur}px`);
+        root.setProperty(ROOT_VARS[1], this.settings.refraction);
+        root.setProperty(ROOT_VARS[2], this.settings.specular);
 
         this.refreshRuntimeStyle();
 
@@ -1186,6 +1288,83 @@ module.exports = class TranslucenceLiquidGlass {
         document.getElementById("tg-preset-picker")?.remove();
     }
 
+    // ---- inspector (press the hotkey click something, it tells you why it is / isnt glass) ----
+    describe(el) {
+        const classes = [...el.classList].slice(0, 2).map(c => c.replace(/_{1,2}[a-zA-Z0-9]{5,8}$/, ""));
+        return `${el.tagName.toLowerCase()}${classes.length ? "." + classes.join(".") : ""}`;
+    }
+
+    statusOf(el) {
+        const record = this.records.get(el);
+
+        if (record) {
+            const notes = [];
+            const blockers = this.findBlockers(el);
+            if (blockers.length) notes.push(`a parent is blocking it (${blockers[0].reasons})`);
+
+            const bg = getComputedStyle(el).backgroundColor;
+            const alpha = (bg.match(/rgba?\(([^)]+)\)/) || [])[1]?.split(",")[3];
+            if (alpha !== undefined && parseFloat(alpha) > 0.85) notes.push("its own background is almost solid so you cant see through it");
+
+            return `**glass** (${record.key})${notes.length ? ", but " + notes.join(" and ") : ""}`;
+        }
+
+        const key = this.candidates.get(el);
+        if (!key) return "no selector matches this (or its group is turned off)";
+
+        if (!this.visible.has(el)) return `matches ${key}, but its off screen`;
+
+        const m = this.measure(el);
+        if (m.w < 24 || m.h < 18) return `matches ${key}, but its too small`;
+
+        const conflicts = this.conflictsFor(el);
+        if (conflicts.length) return `matches ${key}, skipped because of glass on ${this.describe(conflicts[0])} (${this.records.get(conflicts[0]).key})`;
+
+        if (this.records.size >= this.settings.maxSurfaces) return `matches ${key}, but max glass surfaces is reached`;
+
+        return `matches ${key}, should turn on in a sec`;
+    }
+
+    looksLikeSurface(el) {
+        return el.offsetWidth >= 60 && el.offsetHeight >= 30 && parseFloat(getComputedStyle(el).borderTopLeftRadius) > 0;
+    }
+
+    inspect(target) {
+        const chain = [];
+        for (let n = target; n && n !== document.body && chain.length < 10; n = n.parentElement) chain.push(n);
+
+        const lines = chain.map(el => `- \`${this.describe(el)}\` ${el.offsetWidth}x${el.offsetHeight}: ${this.statusOf(el)}`);
+        const best = chain.find(el => !this.records.has(el) && this.looksLikeSurface(el));
+
+        const hasGlass = chain.some(el => this.records.has(el));
+        const header = hasGlass
+            ? "Glass is on for something in this stack. If it still looks flat, check the notes below."
+            : "Nothing in this stack has glass on it.";
+
+        const text = `${header}\n\n${lines.join("\n")}${best ? `\n\nBest guess for the visible card: \`${this.describe(best)}\`` : ""}`;
+
+        console.info("[TranslucenceLiquidGlass] inspect\n" + text.replace(/\*\*|`/g, ""));
+
+        try {
+            BdApi.UI.showConfirmationModal("Glass check", text, {
+                confirmText: best && !hasGlass ? "Add best guess as glass" : "Close",
+                cancelText: best && !hasGlass ? "Close" : null,
+                onConfirm: () => {
+                    if (!best || hasGlass) return;
+                    const selector = this.selectorFor(best);
+                    const list = this.settings.customSelectors.split("\n").map(x => x.trim()).filter(Boolean);
+                    if (!list.includes(selector)) list.push(selector);
+                    this.settings.customSelectors = list.join("\n");
+                    this.settings.groups.custom = true;
+                    this.saveSettings();
+                    this.queueApply("scan");
+                }
+            });
+        } catch (e) {
+            try { BdApi.UI.alert("Glass check", text); } catch (err) { /* ignore */ }
+        }
+    }
+
     // ---- element picker (discord classes are hashed so this grabs a selector for you) ----
     startPicker(onPick) {
         this.stopPicker();
@@ -1211,7 +1390,7 @@ module.exports = class TranslucenceLiquidGlass {
             e.stopPropagation();
             const el = target(e);
             this.stopPicker();
-            if (el) onPick(this.selectorFor(el));
+            if (el) onPick(el, this.selectorFor(el));
         };
 
         const key = e => { if (e.key === "Escape") this.stopPicker(); };
@@ -1222,7 +1401,7 @@ module.exports = class TranslucenceLiquidGlass {
 
         this.picker = { outline, move, click, key };
 
-        try { BdApi.UI.showToast("Click the element you want as glass (Esc cancels).", { type: "info" }); } catch (e) { /* ignore */ }
+        try { BdApi.UI.showToast("Click the thing you want to check (Esc cancels).", { type: "info" }); } catch (e) { /* ignore */ }
     }
 
     stopPicker() {
@@ -1241,7 +1420,8 @@ module.exports = class TranslucenceLiquidGlass {
             .filter(Boolean)
             .map(match => `[class*='${match[1]}_']`);
 
-        return `#app-mount ${el.tagName.toLowerCase()}${classes[0] || ""}`;
+        // 2 classes is usually enough to not match random other stuff
+        return `#app-mount ${el.tagName.toLowerCase()}${classes.slice(0, 2).join("")}`;
     }
 
     // ---- settings panel ----
@@ -1539,7 +1719,7 @@ module.exports = class TranslucenceLiquidGlass {
             area.style.cssText = "width:100%;box-sizing:border-box;font-family:monospace;font-size:12px;border-radius:8px;padding:8px;";
             area.addEventListener("change", () => this.updateSetting("customSelectors", area.value));
             customBox.append(customTitle, area, button("Pick an element…", () => {
-                this.startPicker(selector => {
+                this.startPicker((el, selector) => {
                     const next = [area.value.trim(), selector].filter(Boolean).join("\n");
                     area.value = next;
                     this.settings.groups.custom = true;
@@ -1594,10 +1774,12 @@ module.exports = class TranslucenceLiquidGlass {
             // compat
             heading("Compatibility");
             toggle("Avoid nested glass", "If two glass surfaces overlap, keep the higher-priority one and skip the other.", () => s.avoidNesting, v => this.updateSetting("avoidNesting", v));
+            toggle("Clear big inner backdrop-filters", "A see-through layer inside a popout / profile card that covers most of it and has its own blur can sit on top of the refraction. This clears only those (small stuff like pills is left alone).", () => s.neutralizeInner, v => this.updateSetting("neutralizeInner", v));
             toggle("Neutralize ancestor backdrop-filters (recommended)", "Themes often put backdrop-filter: blur(0px) on parent panes. That silently makes them a backdrop root and stops glass inside them from refracting. This clears it on the ancestors only while glass is active.", () => s.neutralizeAncestors, v => this.updateSetting("neutralizeAncestors", v));
 
             // debug
             heading("Debug");
+            toggle("Inspector hotkey (Ctrl + Shift + G)", "Open a popout / profile / whatever, press the hotkey and click it. Tells you if it's glass and why not. Settings closes popouts so use the hotkey instead of the picker for those.", () => s.hotkey, v => this.updateSetting("hotkey", v));
             toggle("Highlight glass surfaces", "Dashed outline on every active surface.", () => s.highlight, v => this.updateSetting("highlight", v));
             toggle("Debug logging", "Logs skipped surfaces and any ancestor that blocks refraction.", () => s.debug, v => this.updateSetting("debug", v));
 
