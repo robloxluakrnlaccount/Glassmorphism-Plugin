@@ -25,7 +25,8 @@ It should be fine, and bugs could be minor, meaning they do almost no harm, but 
 
 
 If you want the best Refraction & Performance setup, you can simply copy this and rewrite the config.json with it.
-```{
+```
+{
     "settings": {
         "settingsVersion": 4,
         "presetChosen": "Default",
@@ -71,4 +72,5 @@ If you want the best Refraction & Performance setup, you can simply copy this an
         "highlight": false,
         "debug": false
     }
-}```
+}
+```
