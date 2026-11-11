@@ -1,7 +1,7 @@
 /**
  * @name Liquid Glass (glassmorphism)
  * @author scripteditorpro
- * @version 4.3.1
+ * @version 4.6.0
  * @description Adds glassmorphism to Discord, mostly for transparent themes (Translucence by CapnKitten recommended). Adds actual refraction to UI elements, with settings you can change. WARNING: might lag. Change the settings to make it smoother if needed.
  */
 "use strict";
@@ -11,8 +11,27 @@ const SETTINGS_VERSION = 4;
 const SVG_NS = "http://www.w3.org/2000/svg";
 const ATTR = "data-tg-glass";
 const ATTR_KIND = "data-tg-kind";
+const ATTR_LAYER = "data-tg-layer";
+const ATTR_MOVED = "data-tg-moved";
+
+// translucence hard codes brightness(1.1) in its css (not a variable) so we copy it when matching the theme
+const THEME_BRIGHTNESS = 1.1;
 const DEFS_ID = "tg-liquid-glass-definitions";
-const INNER_GROUPS = new Set(["modals", "popouts", "tooltips", "cards", "activity", "custom"]);
+const INNER_GROUPS = new Set(["modals", "popouts", "tooltips", "pickers", "cards", "bars", "activity", "settings", "custom"]);
+
+// groups that get the lighter tint (the plate behind the glass). translucence makes these 46% black which hides the refraction
+const TINT_GROUPS = new Set(["modals", "popouts", "tooltips", "pickers", "bars", "activity", "settings", "custom"]);
+
+// these live in their own layer on top of everything and can have submenus inside them. glass goes on
+// a ::before layer for them (same trick the theme uses for menus) so nothing inside gets blinded or moved
+const LAYER_AUTO = { modals: "pseudo", popouts: "pseudo", tooltips: "pseudo", pickers: "pseudo" };
+
+// stuff that pops up and goes away, we check new nodes for these right away instead of waiting for a scan
+const TRANSIENT = new Set(["modals", "popouts", "tooltips", "pickers", "settings", "bars"]);
+
+// the pseudo layer. position / size / z-index are the same as what the theme does for its menus
+const PSEUDO_CSS = `[${ATTR_MOVED}="before"]::before,[${ATTR_MOVED}="after"]::after{content:" "!important;display:block!important;position:absolute!important;inset:0!important;z-index:-1!important;border-radius:inherit!important;pointer-events:none!important;backdrop-filter:var(--tg-moved-bf)!important;-webkit-backdrop-filter:var(--tg-moved-bf)!important;}
+[${ATTR}="active"][${ATTR_LAYER}="pseudo"]::before{content:" "!important;display:block!important;position:absolute!important;inset:0!important;z-index:-1!important;border-radius:inherit!important;pointer-events:none!important;backdrop-filter:var(--tg-filter)!important;-webkit-backdrop-filter:var(--tg-filter)!important;}`;
 // a custom selector that matches more than this many elements is way too broad, we skip it
 const MAX_CUSTOM_MATCHES = 30;
 const BIG_OK = new Set(["modals", "settings", "panes", "custom"]);
@@ -45,7 +64,12 @@ const GROUPS = {
         selectors: [
             "#app-mount [class*='modal_']:not([class*='modalContent'])",
             "#app-mount [class*='root_'][class*='fullscreenOnMobile']",
-            "#app-mount .user-profile-modal"
+            "#app-mount .user-profile-modal",
+            // the ones translucence styles as modals
+            "#app-mount [class*='root__KoJTP']",
+            "#app-mount [class*='container_dvN-MP']",
+            "#app-mount [class*='uploadModal_']",
+            "#app-mount .bd-modal-root"
         ]
     },
     popouts: {
@@ -58,6 +82,26 @@ const GROUPS = {
             "#app-mount .user-profile-popout"
         ]
     },
+    pickers: {
+        label: "Pickers & dropdowns (emoji, GIF, autocomplete...)", rank: 1,
+        selectors: [
+            "#app-mount [class*='emojiPicker_']",
+            "#app-mount [class*='contentWrapper_58b0l2']",
+            "#app-mount [class*='diversitySelectorOptions_']",
+            "#app-mount [class*='autocomplete_']",
+            "#app-mount [class*='container_d5ae15']",
+            "#app-mount [class*='messagesPopoutWrap_']",
+            "#app-mount [class*='contentWrapper_Z0Mo0M']",
+            "#app-mount [class*='container_cbVzxY']",
+            "#app-mount [class*='container_c0tu5x']",
+            "#app-mount [class*='container_Xweo-z']",
+            "#app-mount [class*='container_aTnRjo']",
+            "#app-mount [class*='container_uTMZTY']",
+            "#app-mount [class*='container__9497c']",
+            "#app-mount [class*='topicsPillContainer_']",
+            "#app-mount [class*='wrapper_-sZhZn']"
+        ]
+    },
     tooltips: {
         label: "Tooltips", rank: 1,
         selectors: ["#app-mount [class*='tooltip_']:not([class*='tooltipPointer']):not([class*='tooltipContent'])"]
@@ -67,6 +111,16 @@ const GROUPS = {
         selectors: [
             "#app-mount [class*='channelTextArea'] [class*='scrollableContainer']",
             "#app-mount form [class*='channelTextArea']:not(:has([class*='scrollableContainer']))"
+        ]
+    },
+    bars: {
+        label: "Floating bars & toolbars (jump to present, format toolbar, BD notices)", rank: 3,
+        selectors: [
+            "#app-mount [class*='jumpToPresentBar_']",
+            "#app-mount [class*='toolbar_hPmUPu']",
+            "#app-mount [class*='actionButtons_Q2cxvN']",
+            "#app-mount .bd-notice",
+            "#app-mount .bd-notification"
         ]
     },
     cards: {
@@ -91,12 +145,10 @@ const GROUPS = {
         ]
     },
     settings: {
-        label: "Settings overlay (large)", rank: 8,
-        selectors: [
-            "#app-mount [class*='standardSidebarView']",
-            "#app-mount [class*='sidebarRegion']",
-            "#app-mount [class*='contentRegion']"
-        ]
+        // one surface for the whole settings window (what the theme styles), wins over the buttons / cards
+        // inside it so those dont blind it, and it also means way fewer filters on screen
+        label: "Settings window (large)", rank: 0,
+        selectors: ["#app-mount [class*='standardSidebarView']"]
     },
     panes: {
         label: "Big panes: sidebar / chat / members (large)", rank: 9,
@@ -104,7 +156,7 @@ const GROUPS = {
     }
 };
 
-const GROUP_ORDER = ["modals", "popouts", "tooltips", "composer", "cards", "activity", "messages", "buttons", "custom", "settings", "panes"];
+const GROUP_ORDER = ["modals", "popouts", "tooltips", "pickers", "composer", "cards", "bars", "activity", "messages", "buttons", "custom", "settings", "panes"];
 
 const DEFAULTS = {
     settingsVersion: SETTINGS_VERSION,
@@ -125,6 +177,10 @@ const DEFAULTS = {
     quality: 1,
 
     // looks
+    useThemeTint: false,    // false = we lighten the plate behind glass (translucence is 0.46 black)
+    tintOpacity: 0.22,
+    matchTheme: true,       // copy saturation / brightness / light angle from the theme if it has them
+    useThemeBlur: false,    // also use the themes blur amount
     blur: 0.6,
     saturation: 1.25,
     brightness: 1.05,
@@ -134,10 +190,11 @@ const DEFAULTS = {
 
     // where it goes
     groups: {
-        modals: true, popouts: true, tooltips: false, composer: true, cards: true,
+        modals: true, popouts: true, tooltips: true, pickers: true, composer: true, cards: true, bars: true,
         activity: true, custom: true, messages: true, buttons: true,
-        settings: false, panes: false
+        settings: true, panes: false
     },
+    groupsVersion: 2,
     customSelectors: "",
     maxSurfaces: 80,
     avoidNesting: true,
@@ -150,7 +207,7 @@ const DEFAULTS = {
     largeDetail: "lite",    // full | lite | blur
     largeQuality: 0.5,      // map res multiplier for big surfaces
 
-    // per group overrides
+    // per group overrides (see BASE_PROFILE)
     profiles: {},
 
     // debug
@@ -167,14 +224,17 @@ const BASE_PROFILE = {
     thicknessPx: 40,
     bezelPx: 12,
     detail: "auto",         // auto / full / lite / blur
+    layer: "auto",          // auto / pseudo (::before layer) / direct (filter on the element)
     quality: 0              // 0 = use the global one
 };
 
 const PROFILE_PRESETS = {
     messages: { sizeMode: "fixed", thicknessPx: 28, bezelPx: 10 },
     popouts: { sizeMode: "fixed", thicknessPx: 36, bezelPx: 12 },
+    pickers: { sizeMode: "fixed", thicknessPx: 36, bezelPx: 12 },
     modals: { sizeMode: "fixed", thicknessPx: 32, bezelPx: 12 },
     cards: { sizeMode: "fixed", thicknessPx: 30, bezelPx: 11 },
+    bars: { sizeMode: "fixed", thicknessPx: 20, bezelPx: 8 },
     settings: { sizeMode: "fixed", thicknessPx: 24, bezelPx: 10 },
     panes: { sizeMode: "fixed", thicknessPx: 24, bezelPx: 10 }
 };
@@ -192,7 +252,7 @@ const PRESETS = {
         values: {
             quality: 2, blur: 0.4, specular: 1, specularWidth: 1.8, thicknessRel: 3.5,
             saturation: 1.3, brightness: 1.06, maxSurfaces: 160, largeQuality: 1,
-            groups: { tooltips: true, settings: true }
+            groups: { tooltips: true, settings: true, bars: true }
         }
     },
     High: {
@@ -213,7 +273,7 @@ const PRESETS = {
         desc: "Just the message bar, popouts and modals, low res maps. Best pick if you're not sure or your PC is weaker.",
         values: {
             quality: 0.5, blur: 0.4, specular: 0.6, maxSurfaces: 30, largeDetail: "blur", largeQuality: 0.25,
-            groups: { messages: false, cards: false, activity: false, tooltips: false, buttons: false, settings: false, panes: false },
+            groups: { messages: false, cards: false, bars: false, activity: false, tooltips: false, pickers: false, buttons: false, settings: false, panes: false },
             profiles: {
                 composer: { detail: "lite" },
                 popouts: { detail: "lite" },
@@ -278,6 +338,7 @@ module.exports = class TranslucenceLiquidGlass {
         this.neutral = new Map();       // ancestor -> { prev, refs }
         this.cleanAncestors = new WeakSet();
         this.refreshQueue = [];
+        this.theme = null;
         this.filterCounter = 0;
     }
 
@@ -286,12 +347,19 @@ module.exports = class TranslucenceLiquidGlass {
         let saved = {};
         try { saved = BdApi.Data.load(PLUGIN_ID, "settings") || {}; } catch (e) { /* ignore */ }
 
-        // old settings used a different scale
+        // old (before v4) settings used a different scale
         const compatible = saved.settingsVersion === SETTINGS_VERSION;
         const base = compatible ? saved : { enabled: saved.enabled !== false, debug: !!saved.debug };
 
         const settings = { ...DEFAULTS, ...base, settingsVersion: SETTINGS_VERSION };
         settings.groups = { ...DEFAULTS.groups, ...(base.groups || {}) };
+
+        // tooltips + settings used to be off by default. turn them on once for older configs (not for Lite, thats on purpose)
+        if (compatible && (saved.groupsVersion || 1) < 2 && saved.presetChosen !== "Lite (Best)") {
+            settings.groups.tooltips = true;
+            settings.groups.settings = true;
+        }
+        settings.groupsVersion = 2;
         settings.profiles = { ...(base.profiles || {}) };
         return settings;
     }
@@ -308,7 +376,7 @@ module.exports = class TranslucenceLiquidGlass {
     start() {
         if (this.running || this.waiting) return;
 
-        // fresh install; show the picker first and dont touch discord yet
+        // fresh install: show the picker first and dont touch discord yet
         if (this.needsPreset) {
             this.waiting = true;
             this.showPresetPicker();
@@ -341,12 +409,13 @@ module.exports = class TranslucenceLiquidGlass {
                 if (entry.isIntersecting) this.visible.add(entry.target);
                 else this.visible.delete(entry.target);
             }
-            this.queueReconcile();
+            this.queueReconcile(0);
         }, { rootMargin: "120px" });
 
         this.mutationObserver = new MutationObserver(mutations => {
             // ignore our own svg stuff
             if (mutations.every(m => this.root && this.root.contains(m.target))) return;
+            this.fastScan(mutations);
             this.queueScan();
         });
         this.mutationObserver.observe(document.getElementById("app-mount") || document.body, { childList: true, subtree: true });
@@ -358,6 +427,8 @@ module.exports = class TranslucenceLiquidGlass {
             this.startPicker(el => this.inspect(el));
         };
         document.addEventListener("keydown", this.onKey, true);
+
+        this.theme = this.readTheme();
 
         this.refreshRuntimeStyle();
         this.scan();
@@ -416,9 +487,43 @@ module.exports = class TranslucenceLiquidGlass {
         this.scanTimer = setTimeout(() => { this.scanTimer = null; if (!document.hidden) this.scan(); }, 250);
     }
 
-    queueReconcile() {
+    queueReconcile(delay = 30) {
         if (!this.running || this.reconcileTimer) return;
-        this.reconcileTimer = setTimeout(() => { this.reconcileTimer = null; this.reconcile(); }, 30);
+        this.reconcileTimer = setTimeout(() => { this.reconcileTimer = null; this.reconcile(); }, delay);
+    }
+
+    // menus / popouts / pickers show up and disappear fast, so look at just the new nodes right away
+    // (the full scan is debounced and new menus would show the themes plain blur until it runs)
+    fastScan(mutations) {
+        if (!this.settings.enabled) return;
+
+        const added = [];
+        for (const m of mutations) {
+            for (const n of m.addedNodes) {
+                if (n.nodeType === 1 && !(this.root && this.root.contains(n))) added.push(n);
+                if (added.length >= 40) break;
+            }
+            if (added.length >= 40) break;
+        }
+        if (!added.length) return;
+
+        for (const key of TRANSIENT) {
+            if (!this.settings.groups[key]) continue;
+            const joined = GROUPS[key].selectors.join(",");
+
+            for (const n of added) {
+                let hits;
+                try { hits = [...(n.matches(joined) ? [n] : []), ...n.querySelectorAll(joined)]; }
+                catch (e) { continue; }
+
+                for (const el of hits) {
+                    const prior = this.candidates.get(el);
+                    if (prior && GROUPS[prior].rank <= GROUPS[key].rank) continue;
+                    if (!prior) this.intersectionObserver.observe(el);
+                    this.candidates.set(el, key);
+                }
+            }
+        }
     }
 
     selectorsFor(key) {
@@ -431,6 +536,23 @@ module.exports = class TranslucenceLiquidGlass {
 
     scan() {
         if (!this.running) return;
+
+        // theme css can change while discord is open, redo the filters if it did
+        const theme = this.readTheme();
+        if (this.theme && JSON.stringify(theme) !== JSON.stringify(this.theme)) {
+            this.theme = theme;
+            this.refreshAll();
+        } else if (!this.theme) {
+            this.theme = theme;
+        }
+
+        // a ::before layer cant see through its own element if the theme gave that element a backdrop-filter
+        // (some of its rules only kick in later, like for stacked menus). switch those to direct
+        for (const [el, rec] of [...this.records]) {
+            if (rec.layer !== "pseudo") continue;
+            const own = getComputedStyle(el).backdropFilter;
+            if (own && own !== "none") this.detach(el);
+        }
 
         const found = new Map();
 
@@ -531,6 +653,42 @@ module.exports = class TranslucenceLiquidGlass {
         }
     }
 
+    // ---- tint ----
+    // translucence draws glass with background: var(--popout-color) (46% black) and tooltips with an 80% accent
+    // colour. thats a dark plate over the refraction so it looks flat. its a variable so we just set a lighter
+    // one on the glass element and the theme's own rules pick it up (the ::before layers inherit it too)
+    applyTint(el, record) {
+        const s = this.settings;
+
+        if (s.useThemeTint || !TINT_GROUPS.has(record.key)) {
+            this.removeTint(el, record);
+            return;
+        }
+
+        if (!record.tint) {
+            record.tint = {
+                popout: [el.style.getPropertyValue("--popout-color"), el.style.getPropertyPriority("--popout-color")],
+                tooltip: [el.style.getPropertyValue("--tooltip-color"), el.style.getPropertyPriority("--tooltip-color")]
+            };
+        }
+
+        const round = n => Math.round(n * 100) / 100;
+        const a = round(clamp(s.tintOpacity, 0, 1));
+        el.style.setProperty("--popout-color", `hsl(0, 0%, 0%, ${a})`);
+        // tooltips keep their accent colour, just less solid (a bit more than the rest so the text stays readable)
+        el.style.setProperty("--tooltip-color", `hsla(var(--accent-hsl), ${round(clamp(a + 0.2, 0.25, 0.8))})`);
+    }
+
+    removeTint(el, record) {
+        if (!record.tint) return;
+
+        for (const [name, key] of [["--popout-color", "popout"], ["--tooltip-color", "tooltip"]]) {
+            const [value, priority] = record.tint[key];
+            if (value) el.style.setProperty(name, value, priority); else el.style.removeProperty(name);
+        }
+        record.tint = null;
+    }
+
     // ---- attach / detach ----
     measure(el) {
         const w = el.offsetWidth || Math.round(el.getBoundingClientRect().width);
@@ -545,13 +703,70 @@ module.exports = class TranslucenceLiquidGlass {
         return { w, h, radius };
     }
 
-    conflictsFor(el) {
+    // box used to tell if two surfaces are basically the same card
+    boxOf(el) {
+        const r = el.getBoundingClientRect();
+        if (r.width * r.height > 0) return { l: r.left, t: r.top, w: r.width, h: r.height };
+        return { l: 0, t: 0, w: el.offsetWidth, h: el.offsetHeight };
+    }
+
+    sameArea(a, b) {
+        const A = this.boxOf(a);
+        const B = this.boxOf(b);
+
+        const w = Math.min(A.l + A.w, B.l + B.w) - Math.max(A.l, B.l);
+        const h = Math.min(A.t + A.h, B.t + B.h) - Math.max(A.t, B.t);
+        if (w <= 0 || h <= 0) return false;
+
+        const inter = w * h;
+        return inter / (A.w * A.h + B.w * B.h - inter) >= 0.8;
+    }
+
+    // what would clash with glass on el. a filter ON an element blinds everything inside it, a ::before
+    // layer doesnt, so those only clash if they are on basically the same card (stacked glass looks wrong)
+    conflictsFor(el, layer = "direct") {
         const list = [];
-        for (const other of this.records.keys()) {
+
+        for (const [other, rec] of this.records) {
             if (other === el) continue;
-            if (other.contains(el) || el.contains(other)) list.push(other);
+
+            const outer = other.contains(el);
+            const inner = el.contains(other);
+            if (!outer && !inner) continue;
+
+            if (outer && rec.layer === "direct") list.push(other);
+            else if (inner && layer === "direct") list.push(other);
+            else if (this.sameArea(el, other)) list.push(other);
         }
+
         return list;
+    }
+
+    // pseudo (::before layer) or direct (filter on the element itself)
+    layerFor(el, key) {
+        const profile = this.getProfile(key);
+        const want = profile.layer === "auto" ? (LAYER_AUTO[key] || "direct") : profile.layer;
+        if (want !== "pseudo") return "direct";
+
+        try {
+            // the theme already put its own backdrop-filter on this element (most of its popouts / modals
+            // do). that makes the element a backdrop root so a ::before layer inside it sees nothing. swap
+            // its filter for ours directly instead, same stacking / size behaviour as before
+            const own = getComputedStyle(el).backdropFilter;
+            if (own && own !== "none") return "direct";
+
+            const before = getComputedStyle(el, "::before");
+            const used = before.content && before.content !== "none" && before.content !== "normal";
+
+            // the theme fakes blur on some things with a filter: blur() copy of the wallpaper, leave those alone
+            if (before.filter && before.filter !== "none") return "direct";
+            // ::before is already used for something that isnt a cover layer
+            if (used && before.position !== "absolute") return "direct";
+        } catch (e) {
+            return "direct";
+        }
+
+        return "pseudo";
     }
 
     attach(el, key) {
@@ -566,9 +781,10 @@ module.exports = class TranslucenceLiquidGlass {
         }
 
         const score = this.surfaceScore(el);
+        const layer = this.layerFor(el, key);
 
         if (this.settings.avoidNesting) {
-            const conflicts = this.conflictsFor(el);
+            const conflicts = this.conflictsFor(el, layer);
             const rank = GROUPS[key].rank;
 
             for (const other of conflicts) {
@@ -595,13 +811,21 @@ module.exports = class TranslucenceLiquidGlass {
             };
         }
 
-        const record = { key, rank: GROUPS[key].rank, score, previous, filterKey: null, w: 0, h: 0, neutralized: [] };
+        const record = { key, rank: GROUPS[key].rank, score, layer, previous, prevPosition: null, filterKey: null, w: 0, h: 0, neutralized: [] };
         this.records.set(el, record);
+
+        // the ::before layer is absolutely positioned so it needs a positioned parent
+        if (layer === "pseudo" && getComputedStyle(el).position === "static") {
+            record.prevPosition = { value: el.style.getPropertyValue("position"), priority: el.style.getPropertyPriority("position") };
+            el.style.setProperty("position", "relative");
+        }
 
         el.setAttribute(ATTR, "active");
         el.setAttribute(ATTR_KIND, key);
+        el.setAttribute(ATTR_LAYER, layer);
 
         this.applyFilterTo(el, record, m);
+        this.applyTint(el, record);
         this.resizeObserver.observe(el);
 
         if (this.settings.neutralizeAncestors) this.neutralizeAncestors(el, record);
@@ -617,13 +841,24 @@ module.exports = class TranslucenceLiquidGlass {
 
         this.resizeObserver.unobserve(el);
 
-        for (const [property, old] of Object.entries(record.previous)) {
-            if (old.value) el.style.setProperty(property, old.value, old.priority);
-            else el.style.removeProperty(property);
+        if (record.layer === "direct") {
+            for (const [property, old] of Object.entries(record.previous)) {
+                if (old.value) el.style.setProperty(property, old.value, old.priority);
+                else el.style.removeProperty(property);
+            }
+        } else {
+            el.style.removeProperty("--tg-filter");
+            if (record.prevPosition) {
+                if (record.prevPosition.value) el.style.setProperty("position", record.prevPosition.value, record.prevPosition.priority);
+                else el.style.removeProperty("position");
+            }
         }
+
+        this.removeTint(el, record);
 
         el.removeAttribute(ATTR);
         el.removeAttribute(ATTR_KIND);
+        el.removeAttribute(ATTR_LAYER);
         if (el.getAttribute("style") === "") el.removeAttribute("style");
 
         clearTimeout(record.refreshTimer);
@@ -663,7 +898,10 @@ module.exports = class TranslucenceLiquidGlass {
         while (this.refreshQueue.length) {
             const el = this.refreshQueue.shift();
             const record = this.records.get(el);
-            if (record && el.isConnected) this.applyFilterTo(el, record, this.measure(el));
+            if (record && el.isConnected) {
+                this.applyFilterTo(el, record, this.measure(el));
+                this.applyTint(el, record);
+            }
             if (performance.now() - start > 8) break;
         }
 
@@ -679,8 +917,13 @@ module.exports = class TranslucenceLiquidGlass {
         const filter = this.acquireFilter(filterKey, plan, m);
         const url = `url("#${filter.id}")`;
 
-        el.style.setProperty("backdrop-filter", url, "important");
-        el.style.setProperty("-webkit-backdrop-filter", url, "important");
+        if (record.layer === "pseudo") {
+            // the css rule for ::before picks this up
+            el.style.setProperty("--tg-filter", url);
+        } else {
+            el.style.setProperty("backdrop-filter", url, "important");
+            el.style.setProperty("-webkit-backdrop-filter", url, "important");
+        }
 
         this.releaseFilter(record.filterKey);
         record.filterKey = filterKey;
@@ -710,6 +953,35 @@ module.exports = class TranslucenceLiquidGlass {
     }
 
     // clears backdrop-filter on one element and remembers how to put it back
+    // does a backdrop-filter value actually do anything (blur(0px) etc dont)
+    filterMatters(value) {
+        if (!value || value === "none") return false;
+
+        const fns = value.match(/[a-z-]+\([^)]*\)/g) || [];
+        if (!fns.length) return true;
+
+        return fns.some(f => {
+            const name = f.slice(0, f.indexOf("("));
+            const n = parseFloat(f.slice(f.indexOf("(") + 1));
+            if (isNaN(n)) return true;
+            if (name === "blur") return n > 0;
+            if (["saturate", "brightness", "contrast", "opacity"].includes(name)) return f.includes("%") ? n !== 100 : n !== 1;
+            return true;
+        });
+    }
+
+    // a pseudo element we can use (the theme uses ::before for a lot of stuff)
+    freePseudo(node) {
+        for (const [which, slot] of [["::before", "before"], ["::after", "after"]]) {
+            const c = getComputedStyle(node, which);
+            if (!c.content || c.content === "none" || c.content === "normal") return slot;
+        }
+        return null;
+    }
+
+    // clears an elements backdrop-filter so it stops blinding what's inside it. if the filter did something
+    // (translucence's content area has blur + saturate + brightness) we move it onto a ::before layer so the
+    // pane keeps its frosted look, otherwise the whole ui goes darker and flat
     neutralizeNode(node, record) {
         if (this.neutral.has(node)) {
             this.neutral.get(node).refs++;
@@ -717,15 +989,36 @@ module.exports = class TranslucenceLiquidGlass {
             return;
         }
 
-        this.neutral.set(node, {
-            refs: 1,
-            prev: {
-                bf: [node.style.getPropertyValue("backdrop-filter"), node.style.getPropertyPriority("backdrop-filter")],
-                wbf: [node.style.getPropertyValue("-webkit-backdrop-filter"), node.style.getPropertyPriority("-webkit-backdrop-filter")]
-            }
-        });
+        const cs = getComputedStyle(node);
+        const original = cs.backdropFilter;
+
+        const prev = {
+            bf: [node.style.getPropertyValue("backdrop-filter"), node.style.getPropertyPriority("backdrop-filter")],
+            wbf: [node.style.getPropertyValue("-webkit-backdrop-filter"), node.style.getPropertyPriority("-webkit-backdrop-filter")],
+            moved: null
+        };
+
+        const slot = this.filterMatters(original) ? this.freePseudo(node) : null;
+
+        if (slot) {
+            prev.moved = {
+                pos: cs.position === "static" ? [node.style.getPropertyValue("position"), node.style.getPropertyPriority("position")] : null,
+                iso: [node.style.getPropertyValue("isolation"), node.style.getPropertyPriority("isolation")]
+            };
+
+            node.style.setProperty("--tg-moved-bf", original);
+            // the layer is absolute so it needs a positioned parent
+            if (prev.moved.pos) node.style.setProperty("position", "relative");
+            // a backdrop-filter made it a stacking context, keep it one so the layer sits right above its background
+            node.style.setProperty("isolation", "isolate");
+            node.setAttribute(ATTR_MOVED, slot);
+        }
+
+        this.neutral.set(node, { refs: 1, prev });
+
         node.style.setProperty("backdrop-filter", "none", "important");
         node.style.setProperty("-webkit-backdrop-filter", "none", "important");
+
         record.neutralized.push(node);
     }
 
@@ -778,6 +1071,21 @@ module.exports = class TranslucenceLiquidGlass {
             const [wbf, wbfp] = n.prev.wbf;
             if (bf) p.style.setProperty("backdrop-filter", bf, bfp); else p.style.removeProperty("backdrop-filter");
             if (wbf) p.style.setProperty("-webkit-backdrop-filter", wbf, wbfp); else p.style.removeProperty("-webkit-backdrop-filter");
+
+            if (n.prev.moved) {
+                p.removeAttribute(ATTR_MOVED);
+                p.style.removeProperty("--tg-moved-bf");
+
+                const [iso, isop] = n.prev.moved.iso;
+                if (iso) p.style.setProperty("isolation", iso, isop); else p.style.removeProperty("isolation");
+
+                if (n.prev.moved.pos) {
+                    const [pos, posp] = n.prev.moved.pos;
+                    if (pos) p.style.setProperty("position", pos, posp); else p.style.removeProperty("position");
+                }
+            }
+
+            if (p.getAttribute("style") === "") p.removeAttribute("style");
             this.neutral.delete(p);
         }
         record.neutralized = [];
@@ -837,9 +1145,47 @@ module.exports = class TranslucenceLiquidGlass {
     }
 
     // ---- filters ----
+    // reads the values translucence (or any theme that uses the same variable names) defines
+    readTheme() {
+        const cs = getComputedStyle(document.documentElement);
+        const get = name => ((cs && cs.getPropertyValue(name)) || "").trim();
+
+        const satRaw = get("--liquid-glass-saturation");
+        const angRaw = get("--light-angle");
+        const blurRaw = get("--popout-blur");
+
+        let saturation = null;
+        if (satRaw && !isNaN(parseFloat(satRaw))) saturation = satRaw.includes("%") ? parseFloat(satRaw) / 100 : parseFloat(satRaw);
+
+        let angle = null;
+        if (angRaw && !isNaN(parseFloat(angRaw))) {
+            const n = parseFloat(angRaw);
+            angle = /rad/.test(angRaw) ? (n * 180) / Math.PI : /turn/.test(angRaw) ? n * 360 : /grad/.test(angRaw) ? n * 0.9 : n;
+        }
+
+        const blur = blurRaw && !isNaN(parseFloat(blurRaw)) ? parseFloat(blurRaw) : null;
+
+        return { detected: saturation !== null || angle !== null || blur !== null, saturation, angle, blur };
+    }
+
+    // the blur / saturation / brightness / light angle that actually get used
+    look() {
+        const s = this.settings;
+        const t = this.theme || {};
+        const match = s.matchTheme && t.detected;
+
+        return {
+            blur: s.useThemeBlur && t.blur != null ? t.blur : s.blur,
+            saturation: match && t.saturation != null ? t.saturation : s.saturation,
+            brightness: match ? THEME_BRIGHTNESS : s.brightness,
+            angle: match && t.angle != null ? t.angle : s.specularAngle
+        };
+    }
+
     colorKey(detail) {
         const s = this.settings;
-        return [s.blur, s.saturation, s.brightness, detail === "full" ? s.specular : "-"].join("|");
+        const l = this.look();
+        return [l.blur, l.saturation, l.brightness, detail === "full" ? s.specular : "-"].join("|");
     }
 
     getProfile(key) {
@@ -881,7 +1227,7 @@ module.exports = class TranslucenceLiquidGlass {
                 m.w, m.h, Math.round(m.radius * 2) / 2,
                 s.surface, thickness.toFixed(1), bezel.toFixed(1),
                 s.ior, s.refraction, s.maxDisplacement, quality.toFixed(2), detail,
-                detail === "full" ? `${s.specularAngle}|${s.specularWidth}` : "-"
+                detail === "full" ? `${this.look().angle}|${s.specularWidth}` : "-"
             ].join("|");
 
         return { detail, thickness, bezel, shortSide, quality, mapKey };
@@ -926,13 +1272,14 @@ module.exports = class TranslucenceLiquidGlass {
     // blur = no refraction at all, no maps cheapest
     buildFilter(id, maps, m, detail) {
         const s = this.settings;
+        const look = this.look();
 
         const node = this.svg("filter", {
             id, x: 0, y: 0, width: 1, height: 1,
             "color-interpolation-filters": "sRGB"
         });
 
-        const blur = this.svg("feGaussianBlur", { in: "SourceGraphic", stdDeviation: s.blur, result: "blurred" });
+        const blur = this.svg("feGaussianBlur", { in: "SourceGraphic", stdDeviation: look.blur, result: "blurred" });
         node.appendChild(blur);
 
         let current = "blurred";
@@ -954,11 +1301,11 @@ module.exports = class TranslucenceLiquidGlass {
             current = "displaced";
         }
 
-        node.appendChild(this.svg("feColorMatrix", { in: current, type: "saturate", values: s.saturation, result: "saturated" }));
+        node.appendChild(this.svg("feColorMatrix", { in: current, type: "saturate", values: look.saturation, result: "saturated" }));
 
         const bright = this.svg("feComponentTransfer", { in: "saturated", result: "bright" });
         for (const channel of ["feFuncR", "feFuncG", "feFuncB"]) {
-            bright.appendChild(this.svg(channel, { type: "linear", slope: s.brightness }));
+            bright.appendChild(this.svg(channel, { type: "linear", slope: look.brightness }));
         }
         node.appendChild(bright);
 
@@ -1028,7 +1375,7 @@ module.exports = class TranslucenceLiquidGlass {
         const innerW = hw - radius;
         const innerH = hh - radius;
 
-        const angle = (s.specularAngle * Math.PI) / 180;
+        const angle = (this.look().angle * Math.PI) / 180;
         const lx = Math.cos(angle);
         const ly = Math.sin(angle);
         const specW = Math.max(0.5, s.specularWidth);
@@ -1093,8 +1440,6 @@ module.exports = class TranslucenceLiquidGlass {
 
         // how far the edge pixels move, capped so it cant tear
         const desired = Math.min(max * s.refraction, shortSide * (s.maxDisplacement / 100));
-
-        // feDisplacementMap moves by scale * (channel - 0.5) but our map only uses 127/255 of that, so fix it
         const scale = desired * (255 / 127);
 
         return {
@@ -1119,14 +1464,12 @@ module.exports = class TranslucenceLiquidGlass {
 
     // ---- applying settings ----
     refreshRuntimeStyle() {
-        let css = "";
+        let css = PSEUDO_CSS;
         if (this.settings.highlight) {
             css += `[${ATTR}="active"]{outline:1px dashed rgba(0,255,170,.9)!important;outline-offset:-1px;}`;
         }
 
         this.removeRuntimeStyle();
-
-        if (!css) return;
 
         try { BdApi.DOM.addStyle(STYLE_ID, css); }
         catch (e) {
@@ -1146,7 +1489,7 @@ module.exports = class TranslucenceLiquidGlass {
         if (!this.running) return;
 
         const root = document.documentElement.style;
-        root.setProperty(ROOT_VARS[0], `${this.settings.blur}px`);
+        root.setProperty(ROOT_VARS[0], `${this.look().blur}px`);
         root.setProperty(ROOT_VARS[1], this.settings.refraction);
         root.setProperty(ROOT_VARS[2], this.settings.specular);
 
@@ -1340,7 +1683,7 @@ module.exports = class TranslucenceLiquidGlass {
             const alpha = (bg.match(/rgba?\(([^)]+)\)/) || [])[1]?.split(",")[3];
             if (alpha !== undefined && parseFloat(alpha) > 0.85) notes.push("its own background is almost solid so you cant see through it");
 
-            return `**glass** (${record.key})${notes.length ? ", but " + notes.join(" and ") : ""}`;
+            return `**glass** (${record.key}, ${record.layer} layer)${notes.length ? ", but " + notes.join(" and ") : ""}`;
         }
 
         const key = this.candidates.get(el);
@@ -1351,7 +1694,7 @@ module.exports = class TranslucenceLiquidGlass {
         const m = this.measure(el);
         if (m.w < 24 || m.h < 18) return `matches ${key}, but its too small`;
 
-        const conflicts = this.conflictsFor(el);
+        const conflicts = this.conflictsFor(el, this.layerFor(el, key));
         if (conflicts.length) return `matches ${key}, skipped because of glass on ${this.describe(conflicts[0])} (${this.records.get(conflicts[0]).key})`;
 
         if (this.records.size >= this.settings.maxSurfaces) return `matches ${key}, but max glass surfaces is reached`;
@@ -1725,6 +2068,12 @@ module.exports = class TranslucenceLiquidGlass {
                     ["blur", "Blur only (cheapest)"]
                 ]);
 
+                miniSelect(body, "Glass layer", key, "layer", [
+                    ["auto", "Auto"],
+                    ["pseudo", "Pseudo layer (no layout side effects)"],
+                    ["direct", "Direct on the element"]
+                ]);
+
                 miniSelect(body, "Map quality", key, "quality", [
                     ["0", "Use global"], ["0.25", "0.25×"], ["0.5", "0.5×"], ["1", "1×"], ["2", "2×"]
                 ]);
@@ -1835,12 +2184,28 @@ module.exports = class TranslucenceLiquidGlass {
                 [["0.25", "0.25×"], ["0.5", "0.5×"], ["1", "1×"]]);
 
             // looks
-            heading("Look");
-            slider("Backdrop blur", null, "blur", 0, 8, 0.1, "px");
-            slider("Saturation", null, "saturation", 0.5, 2, 0.05);
-            slider("Brightness", null, "brightness", 0.7, 1.5, 0.01);
+            const t = this.theme || {};
+            const themeNote = t.detected
+                ? `Theme detected: saturation ${t.saturation != null ? Math.round(t.saturation * 100) + "%" : "n/a"}, brightness ${THEME_BRIGHTNESS}x, light angle ${t.angle != null ? t.angle + "°" : "n/a"}, blur ${t.blur != null ? t.blur + "px" : "n/a"}.`
+                : "No Translucence variables found so the sliders below are used.";
+
+            heading("Look", themeNote);
+            toggle("Match the theme (saturation, brightness, light angle)", "Translucence puts saturate(150%) brightness(1.1) on its glass. Matching that keeps the UI from looking darker or flatter when glass replaces the themes own filter. Turn off to use the sliders.", () => s.matchTheme, v => this.updateSetting("matchTheme", v, rebuild));
+            toggle("Use the theme's blur amount too", "Off by default, the refraction looks better with very little blur.", () => s.useThemeBlur, v => this.updateSetting("useThemeBlur", v, rebuild));
+
+            toggle("Use the theme's tint instead", "Translucence puts a 46% black plate behind popouts, modals and settings (80% accent colour on tooltips). That's what makes things look dark and opaque. Off = the lighter tint below.", () => s.useThemeTint, v => this.updateSetting("useThemeTint", v, rebuild));
+            if (!s.useThemeTint) {
+                slider("Glass tint", "How dark the plate behind popouts, menus, modals, tooltips and settings is. Lower = clearer glass, higher = easier to read. Tooltips keep their accent colour.", "tintOpacity", 0, 0.8, 0.01);
+            }
+
+            const matched = s.matchTheme && t.detected;
+            slider("Backdrop blur", s.useThemeBlur && t.blur != null ? "Using the theme's blur right now." : null, "blur", 0, 8, 0.1, "px");
+            if (!matched) {
+                slider("Saturation", null, "saturation", 0.5, 2, 0.05);
+                slider("Brightness", null, "brightness", 0.7, 1.5, 0.01);
+            }
             slider("Specular highlight", "Opacity of the bright rim.", "specular", 0, 1.5, 0.01);
-            slider("Light angle", null, "specularAngle", 0, 360, 1, "°");
+            if (!matched) slider("Light angle", null, "specularAngle", 0, 360, 1, "°");
             slider("Highlight width", null, "specularWidth", 0.5, 5, 0.1, "px");
 
             // compat
