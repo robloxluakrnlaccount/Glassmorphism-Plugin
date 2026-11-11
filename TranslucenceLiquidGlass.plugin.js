@@ -3,6 +3,7 @@
  * @author scripteditorpro
  * @version 4.6.0
  * @description Adds glassmorphism to Discord, mostly for transparent themes (Translucence by CapnKitten recommended). Adds actual refraction to UI elements, with settings you can change. WARNING: might lag. Change the settings to make it smoother if needed.
+ * @source https://github.com/robloxluakrnlaccount/Glassmorphism-Plugin
  */
 "use strict";
 
